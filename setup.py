@@ -54,5 +54,6 @@ setup(
         click-odoo-backupdb=click_odoo_contrib.backupdb:main
         click-odoo-restoredb=click_odoo_contrib.restoredb:main
         click-odoo-makepot=click_odoo_contrib.makepot:main
+        click-odoo-check_neutralized=click_odoo_contrib.check_neutralized:main
     """,
 )
