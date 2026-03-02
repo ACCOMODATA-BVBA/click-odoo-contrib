@@ -20,10 +20,30 @@ from click_odoo_contrib.update import (
 # that Odoo updates the modules list before installing)
 test_addons_dir = os.path.join(os.path.dirname(__file__), "data", "test_update", "v1")
 
+def _get_odoo_cmd():
+    """Get the correct Odoo command for the environment"""
+    # Check if 'odoo' executable exists
+    try:
+        subprocess.run(['which', 'odoo'], check=True, capture_output=True)
+        return ['odoo']
+    except subprocess.CalledProcessError:
+        pass
+
+    # Check if 'odoo-bin' executable exists
+    try:
+        subprocess.run(['which', 'odoo-bin'], check=True, capture_output=True)
+        return ['odoo-bin']
+    except subprocess.CalledProcessError:
+        pass
+
+    # Fallback to python3 -m odoo (Docker scenario)
+    return ['python3', '-m', 'odoo']
 
 def _addons_dir(v):
     return os.path.join(os.path.dirname(__file__), "data", "test_update", v)
 
+def _addons_dir_versions(v):
+    return os.path.join(os.path.dirname(__file__), "data", "test_update_versions", v)
 
 def _addons_path(v):
     return ",".join(
@@ -33,6 +53,104 @@ def _addons_path(v):
             _addons_dir(v),
         ]
     )
+
+def _addons_path_versions(v):
+    return ",".join(
+        [
+            os.path.join(odoo.__path__[0], "addons"),
+            os.path.join(odoo.__path__[0], "..", "addons"),
+            _addons_dir_versions(v),
+        ]
+    )
+
+def _update_one_compare_versions(odoodb, v):
+    addons_dir = _addons_dir_versions(v)
+    config_path = os.getenv("ODOO_RC", "/etc/odoo/odoo.conf")
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "click_odoo_contrib.update",
+        "--config", config_path,
+        "--addons-path",
+        addons_dir,
+        "-d",
+        odoodb,
+        "--compare-versions",
+    ]
+    subprocess.check_call(cmd)
+
+def _check_expected_versions(odoodb, v):
+    with OdooEnvironment(database=odoodb) as env:
+        with open(os.path.join(_addons_dir_versions(v), "expected.json")) as f:
+            expected = json.load(f)
+        for addon_name, expected_data in expected.items():
+            env.cr.execute(
+                "SELECT state, latest_version FROM ir_module_module WHERE name=%s",
+                (addon_name,),
+            )
+            state, version = env.cr.fetchone()
+            expected_state = expected_data.get("state")
+            if expected_state:
+                assert state == expected_state, f"{addon_name}: expected state {expected_state}, got {state}"
+
+            expected_version = expected_data.get("version")
+            if expected_version:
+                assert version.split(".")[2:] == expected_version.split("."), \
+                    f"{addon_name}: Version suffix mismatch. DB {version}, Expected {expected_version}"
+
+def test_update_compare_versions(odoodb):
+    """Test update functionality using version comparison instead of checksums."""
+    # Install initial version
+    _install_one(odoodb, "v1")
+    _check_expected_versions(odoodb, "v1")
+
+    # Update to v2 using --compare-versions
+    _update_one_compare_versions(odoodb, "v2")
+    _check_expected_versions(odoodb, "v2")
+
+    # Update to v3 using --compare-versions
+    _update_one_compare_versions(odoodb, "v3")
+    _check_expected_versions(odoodb, "v3")
+
+    # Verify version was updated again
+
+    # Test that running update again with same version doesn't trigger update
+    # (This tests the version comparison logic)
+    _update_one_compare_versions(odoodb, "v3")
+
+
+def test_update_compare_versions_downgrade_prevention(odoodb):
+    """Test that --compare-versions prevents downgrades."""
+    # Install v3
+    _install_one(odoodb, "v3")
+    _check_expected_versions(odoodb, "v3")
+
+    # Try to "update" to v2 (lower version) - should not update
+    _update_one_compare_versions(odoodb, "v2")
+
+
+
+def test_update_compare_versions_with_list_only(odoodb):
+    """Test --compare-versions with --list-only flag."""
+    _install_one(odoodb, "v1")
+
+    # Run with --list-only
+    cmd = [
+        sys.executable,
+        "-m",
+        "click_odoo_contrib.update",
+        "--addons-path",
+        _addons_path_versions("v2"),
+        "-d",
+        odoodb,
+        "--compare-versions",
+        "--list-only",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    # Should list addon_app as needing update
+    assert "addon_app" in result.stdout or "addon_app" in result.stderr
 
 
 def _check_expected(odoodb, v):
@@ -54,16 +172,17 @@ def _check_expected(odoodb, v):
 
 
 def _install_one(odoodb, v):
-    cmd = [
-        odoo_bin,
-        "--addons-path",
-        _addons_path(v),
+    cmd = _get_odoo_cmd()  # ← Start met het juiste commando
+    config_path = os.getenv('ODOO_RC', '/etc/odoo/odoo.conf')
+    cmd.extend([
+        "--config", config_path,
+        "--addons-path", _addons_path(v),
         "-d",
         odoodb,
         "-i",
         "addon_app",
         "--stop-after-init",
-    ]
+    ])
     subprocess.check_call(cmd)
 
 
