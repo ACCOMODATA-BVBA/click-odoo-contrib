@@ -5,6 +5,18 @@ import shutil
 import tempfile
 import zipfile
 from contextlib import contextmanager
+import subprocess
+
+import stream_zip
+import datetime
+import to_file_like_obj
+
+# default chunk size for generators in streaming backup
+DEFAULT_CHUNK_SIZE = 64 * 1024
+
+
+class CommandReturnException(Exception):
+    pass
 
 
 class AbstractBackup:
@@ -25,6 +37,14 @@ class AbstractBackup:
         """Recursively add a directory tree into the backup.
         :param dirname: Directory to copy from
         :param arcname: the root path of copied files into the archive
+        """
+        raise NotImplementedError()  # pragma: no cover
+
+    def add_data(self, buffer, arcname):
+        """Add a data buffer to the backup.
+
+        :param buffer: the buffer containing the data
+        :param arcname: the path into the backup
         """
         raise NotImplementedError()  # pragma: no cover
 
@@ -68,10 +88,16 @@ class ZipBackup(AbstractBackup):
                 path = os.path.normpath(os.path.join(dirpath, fname))
                 if os.path.isfile(path):
                     _arcname = os.path.join(arcname, path[len_prefix:])
-                    self._zipFile.write(path, _arcname)
+                    self.addfile(path, _arcname)
 
     def addfile(self, filename, arcname):
         self._zipFile.write(filename, arcname)
+
+    def add_data(self, buffer, arcname):
+        with tempfile.NamedTemporaryFile(mode="w") as f:
+            f.write(buffer)
+            f.seek(0)
+            backup.addfile(f.name, arcname)
 
     def write(self, stream, arcname):
         with tempfile.NamedTemporaryFile() as f:
@@ -117,6 +143,12 @@ class FolderBackup(AbstractBackup):
     def addfile(self, filename, arcname):
         shutil.copyfile(filename, os.path.join(self._path, arcname))
 
+    def add_data(self, buffer, arcname):
+        with tempfile.NamedTemporaryFile(mode="w") as f:
+            f.write(buffer)
+            f.seek(0)
+            shutil.copyfile(f.name, os.path.join(self._path, arcname))
+
     def write(self, stream, arcname):
         with open(os.path.join(self._path, arcname), "wb") as f:
             shutil.copyfileobj(stream, f)
@@ -128,10 +160,106 @@ class FolderBackup(AbstractBackup):
         shutil.rmtree(self._path)
 
 
+class StreamingZipBackup(ZipBackup):
+    format = "stream-zip"
+    chunk_size = DEFAULT_CHUNK_SIZE
+
+    def __init__(self, path, mode, chunk_size=None):
+        if mode != "w":
+            raise NotImplementedError('Only mode "w" is supported here')
+        self._path = path
+        self._mode = mode
+        self._zip_members = []
+        if chunk_size is not None:
+            self.chunk_size = chunk_size
+
+    def add_data(self, buffer, arcname):
+        def _yield_buffer():
+            yield buffer
+
+        self._zip_members.append(
+            (
+                arcname,
+                datetime.datetime.now(),
+                0o664,
+                stream_zip.ZIP_64,
+                _yield_buffer(),
+            )
+        )
+
+    def addfile(self, filename, arcname):
+        print(f"Adding file {filename} to zip as {arcname}")
+
+        def _get_file_chunks():
+            with open(filename, "rb") as fileh:
+                while True:
+                    chunk = fileh.read(self.chunk_size)
+                    if not chunk:
+                        break
+                    yield chunk
+
+        statinfo = os.stat(filename)
+
+        self._zip_members.append(
+            (
+                arcname,
+                datetime.datetime.fromtimestamp(statinfo.st_mtime),
+                0o664,
+                stream_zip.ZIP_64,
+                _get_file_chunks(),
+            )
+        )
+
+    def write(self, stream, arcname):
+        raise NotImplementedError()  # pragma: no cover
+
+    def add_dump_command(self, cmd, env, filename):
+        def _generator():
+            dump = subprocess.Popen(
+                cmd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE
+            )
+
+            while True:
+                chunk = dump.stdout.read(self.chunk_size)
+                if not chunk:
+                    dump.stdout.close()
+                    dump.wait(timeout=60)
+                    if dump.returncode != 0:
+                        raise CommandReturnException()
+                    if dump.returncode == 0:
+                        break
+                yield chunk
+
+        self._zip_members.append(
+            (
+                "dump.sql",
+                datetime.datetime.now(),
+                0o664,
+                stream_zip.ZIP_64,
+                _generator(),
+            )
+        )
+
+    def get_file_object(self):
+        return to_file_like_obj.to_file_like_obj(
+            stream_zip.stream_zip(self._zip_members)
+        )
+
+    def close(self):
+        pass
+
+    def delete(self):
+        try:
+            self.close()
+        finally:
+            os.unlink(self._path)
+
+
 BACKUP_FORMAT = {
     ZipBackup.format: ZipBackup,
     DumpBackup.format: DumpBackup,
     FolderBackup.format: FolderBackup,
+    StreamingZipBackup.format: StreamingZipBackup,
 }
 
 
