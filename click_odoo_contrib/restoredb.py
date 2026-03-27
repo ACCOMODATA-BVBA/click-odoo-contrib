@@ -11,8 +11,125 @@ import click_odoo
 import psycopg2
 from click_odoo import OdooEnvironment, odoo
 
+
 from ._dbutils import db_exists, db_management_enabled, reset_config_parameters
 from .backupdb import DBDUMP_FILENAME, FILESTORE_DIRNAME, MANIFEST_FILENAME
+from ._download_utils import url_chunck_generator
+
+import logging
+from stream_unzip import stream_unzip
+
+
+_logger = logging.getLogger(__name__)
+
+
+def _psql_from_chunks(dbname, chunks):
+    pg_args = [
+        "psql",
+        "--quiet",
+        f"--dbname={dbname}",
+    ]
+    pg_env = odoo.tools.misc.exec_pg_environ()
+    _logger.debug(f"Running {' '.join(pg_args)}")
+    try:
+        psql_popen = subprocess.Popen(
+            pg_args,
+            env=pg_env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            for chunk in chunks:
+                if psql_popen.poll() is not None:
+                    # psql died early
+                    break
+                psql_popen.stdin.write(chunk)
+            psql_popen.stdin.close()
+            psql_popen.wait()
+        except BrokenPipeError:
+            _logger.error("Pipe broken: psql closed the connection early.")
+
+        if psql_popen.returncode != 0:
+            _logger.error("Postgres Restore Failed")
+            raise click.ClickException(
+                f"psql failed with exit code {psql_popen.returncode}"
+            )
+
+    except Exception as e:
+        _logger.exception("Unexpected error during restore")
+        raise click.ClickException("Couldn't restore database") from e
+
+
+def _check_path(full_path):
+    if os.path.exists(full_path):
+        return
+    parent_dir = os.path.dirname(full_path)
+    _check_path(parent_dir)
+    _logger.debug('created folder "%s"', full_path)
+    os.mkdir(full_path)
+
+
+def _restore_file_from_chunks(full_path, chunks):
+    try:
+        _logger.debug('restoring file "%s"', full_path)
+        _check_path(os.path.dirname(full_path))
+        with open(full_path, "wb") as fileh:
+            for chunk in chunks:
+                fileh.write(chunk)
+    except IOError:
+        _logger.exception("Error writing to file %s", full_path)
+        # make sure to finish all chunks
+        for chunk in chunks:
+            pass
+
+
+def _restore_from_zipchunks(dbname, zipped_chunks, copy=True, jobs=1, neutralize=False):
+    filestore_folder = odoo.tools.config.filestore(dbname)
+
+    for f_name, f_size, file_chunks in stream_unzip(zipped_chunks):
+        file_name = f_name.decode("utf-8")
+        if file_name == "dump.sql":
+            _psql_from_chunks(dbname, file_chunks)
+        elif file_name.startswith(f"{FILESTORE_DIRNAME}/"):
+            full_path = os.path.join(
+                filestore_folder, file_name.replace(f"{FILESTORE_DIRNAME}/", "")
+            )
+            _restore_file_from_chunks(full_path, file_chunks)
+        elif file_name == "manifest.json":
+            full_path = os.path.join(filestore_folder, "manifest.json")
+            _restore_file_from_chunks(full_path, file_chunks)
+        else:
+            _logger.warning('Unexpected file "%s" in zip file: ignoring', file_name)
+            # unzipped_chunks must be iterated to completion or
+            # UnfinishedIterationError will be raised
+            for chunk in file_chunks:
+                pass
+
+
+def _restore_from_url(dbname, source, copy, neutralize):
+    chunks_from_url = url_chunck_generator(url=source)
+    odoo.service.db._create_empty_database(dbname)
+    _restore_from_zipchunks(
+        dbname=dbname,
+        zipped_chunks=chunks_from_url,
+        copy=copy,
+        neutralize=neutralize,
+    )
+    if copy:
+        # if it's a copy of a database, force generation of a new dbuuid
+        reset_config_parameters(dbname)
+    with OdooEnvironment(dbname) as env:
+        if neutralize and odoo.release.version_info >= (16, 0):
+            odoo.modules.neutralize.neutralize_database(env.cr)
+
+        if odoo.tools.config["unaccent"]:
+            try:
+                with env.cr.savepoint():
+                    env.cr.execute("CREATE EXTENSION unaccent")
+            except psycopg2.Error:
+                _logger.exception("Exception while creating extension unaccent")
+    odoo.sql_db.close_db(dbname)
 
 
 def _restore_from_folder(dbname, backup, copy=True, jobs=1, neutralize=False):
@@ -137,7 +254,10 @@ def main(env, dbname, source, copy, force, neutralize, jobs):
         raise click.ClickException(
             "--neutralize option is only available in odoo 16.0 and above"
         )
-    if os.path.isfile(source):
+    if source.startswith("http"):
+        _logger.debug('Restoring DB from "%s"', source)
+        _restore_from_url(dbname, source, copy, neutralize)
+    elif os.path.isfile(source):
         _restore_from_file(dbname, source, copy, neutralize)
     else:
         _restore_from_folder(dbname, source, copy, jobs, neutralize)
