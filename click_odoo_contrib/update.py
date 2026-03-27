@@ -181,21 +181,31 @@ def _get_checksum_dir(cr, module_name):
     return checksum_dir
 
 
-def _get_modules_to_update(cr, ignore_addons=None):
+def _get_modules_to_update(cr, ignore_addons=None, compare_versions=False):
     if ignore_addons is None:
         ignore_addons = []
     modules_to_update = []
+    module_manifest_versions = odoo.modules.module.get_modules_with_version()
     checksums = _load_installed_checksums(cr)
+    # latest_version refers the installed version (the one in database)
     cr.execute(
-        "SELECT name FROM ir_module_module WHERE state in ('installed', 'to upgrade')"
+        "SELECT name, latest_version FROM ir_module_module WHERE state in ('installed', 'to upgrade')"
     )
-    for (module_name,) in cr.fetchall():
+    for module_name, module_version in cr.fetchall():
         if not _is_installable(module_name):
             # if the module is not installable, do not try to update it
             continue
         if module_name in ignore_addons:
             continue
-        if _get_checksum_dir(cr, module_name) != checksums.get(module_name):
+        if compare_versions:
+            db_version = odoo.tools.parse_version(module_version)
+            manifest_version = odoo.tools.parse_version(
+                module_manifest_versions.get(module_name)
+            )
+            if manifest_version > db_version:
+                modules_to_update.append(module_name)
+                continue
+        elif _get_checksum_dir(cr, module_name) != checksums.get(module_name):
             modules_to_update.append(module_name)
     return modules_to_update
 
@@ -223,12 +233,15 @@ def _update_db_nolock(
     watcher=None,
     list_only=False,
     ignore_addons=None,
+    compare_versions=False,
 ):
     if update_all:
         modules_to_update = ["base"]
     else:
         with conn.cursor() as cr:
-            modules_to_update = _get_modules_to_update(cr, ignore_addons)
+            modules_to_update = _get_modules_to_update(
+                cr, ignore_addons, compare_versions
+            )
         if modules_to_update:
             _logger.info(
                 "Updating addons for their hash changed: %s.",
@@ -268,6 +281,7 @@ def _update_db(
     list_only=False,
     ignore_addons=None,
     only_compute_hashes=False,
+    compare_versions=False,
 ):
     conn = odoo.sql_db.db_connect(database)
     with conn.cursor() as cr, advisory_lock(cr, "click-odoo-update/" + database):
@@ -286,6 +300,7 @@ def _update_db(
             watcher,
             list_only,
             ignore_addons,
+            compare_versions,
         )
 
 
@@ -323,6 +338,7 @@ def OdooEnvironmentWithUpdate(database, ctx, **kwargs):
             ctx.params["list_only"],
             ignore_addons,
             ctx.params["only_compute_hashes"],
+            ctx.params["compare_versions"],
         )
     finally:
         if watcher:
@@ -383,6 +399,15 @@ def OdooEnvironmentWithUpdate(database, ctx, **kwargs):
         "and you don't want to run `click-odoo-update --update-all`."
     ),
 )
+@click.option(
+    "--compare-versions",
+    is_flag=True,
+    help=(
+        "Compare module versions in the database with the version "
+        "specified in the manifest.  Modules with a higher version "
+        "in the manifest will be updated."
+    ),
+)
 def main(
     env,
     i18n_overwrite,
@@ -393,6 +418,7 @@ def main(
     ignore_addons,
     ignore_core_addons,
     only_compute_hashes,
+    compare_versions,
 ):
     """Update an Odoo database (odoo -u), automatically detecting
     addons to update based on a hash of their file content, compared
