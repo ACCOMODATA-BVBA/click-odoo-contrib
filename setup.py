@@ -25,6 +25,7 @@ setup(
         "botocore",
         "click-odoo>=1.3.0",
         "manifestoo-core>=0.7",
+        "stream_unzip",
         "stream_zip",
         "to_file_like_obj",
         "importlib_resources ; python_version<'3.9'",
