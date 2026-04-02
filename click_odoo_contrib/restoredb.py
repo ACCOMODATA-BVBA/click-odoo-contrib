@@ -230,9 +230,6 @@ def _restore_from_file(dbname, backup, copy=True, neutralize=False):
 @click.argument(
     "source",
     nargs=1,
-    type=click.Path(
-        exists=True, file_okay=True, dir_okay=True, readable=True, resolve_path=True
-    ),
 )
 def main(env, dbname, source, copy, force, neutralize, jobs):
     """Restore an Odoo database backup.
