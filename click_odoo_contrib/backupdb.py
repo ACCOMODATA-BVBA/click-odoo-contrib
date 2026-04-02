@@ -99,7 +99,7 @@ def _get_s3_client(
     aws_secret_access_key=None,
     aws_endpoint_url=None,
     aws_region=None,
-    aws_bucket_name=None,
+    aws_bucketname=None,
 ):
     missing = []
     if aws_access_key_id is None:
@@ -118,10 +118,10 @@ def _get_s3_client(
         aws_region = os.getenv("AWS_REGION")
         if aws_region is None:
             missing.append("aws_region")
-    if aws_bucket_name is None:
-        aws_bucket_name = os.getenv("AWS_BUCKET_NAME")
-        if aws_bucket_name is None:
-            missing.append("aws_bucket_name")
+    if aws_bucketname is None:
+        aws_bucketname = os.getenv("AWS_BUCKETNAME")
+        if aws_bucketname is None:
+            missing.append("aws_bucketname")
 
     if missing:
         raise Exception("Missing s3 credentials: ", ",".join(missing))
@@ -131,7 +131,7 @@ def _get_s3_client(
         aws_secret_access_key=aws_secret_access_key,
         endpoint_url=aws_endpoint_url,
         region_name=aws_region,
-        bucket=aws_bucket_name,
+        bucket=aws_bucketname,
     )
 
 
@@ -199,10 +199,10 @@ def _get_s3_client(
     help="Specify s3 aws_region or define environment value AWS_REGION",
 )
 @click.option(
-    "--aws_bucket_name",
+    "--aws_bucketname",
     default=None,
     show_default=False,
-    help="Specify s3 aws_bucket_name or define environment value AWS_BUCKET_NAME",
+    help="Specify s3 aws_bucketname or define environment value AWS_BUCKETNAME",
 )
 @click.argument("dbname", nargs=1)
 @click.argument("dest", nargs=1, required=1)
@@ -218,7 +218,7 @@ def main(
     aws_secret_access_key,
     aws_endpoint_url,
     aws_region,
-    aws_bucket_name,
+    aws_bucketname,
 ):
     """Create an Odoo database backup from an existing one.
 
@@ -261,7 +261,7 @@ def main(
             aws_secret_access_key,
             aws_endpoint_url,
             aws_region,
-            aws_bucket_name,
+            aws_bucketname,
         )
         s3_client.test_access_upload(dest)
 
