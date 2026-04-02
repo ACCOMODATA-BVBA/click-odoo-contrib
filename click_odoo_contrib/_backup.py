@@ -188,8 +188,6 @@ class StreamingZipBackup(ZipBackup):
         )
 
     def addfile(self, filename, arcname):
-        print(f"Adding file {filename} to zip as {arcname}")
-
         def _get_file_chunks():
             with open(filename, "rb") as fileh:
                 while True:
