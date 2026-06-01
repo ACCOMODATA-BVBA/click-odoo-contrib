@@ -8,6 +8,21 @@ import shutil
 import subprocess
 import fsspec
 
+# Monkey patch s3fs to fix InvalidPartOrder during concurrent uploads
+try:
+    import s3fs.core
+    _original_s3fs_commit = s3fs.core.S3File.commit
+    def _patched_s3fs_commit(self):
+        if hasattr(self, "parts") and isinstance(self.parts, list):
+            try:
+                self.parts.sort(key=lambda x: x.get("PartNumber", 0))
+            except Exception:
+                pass
+        return _original_s3fs_commit(self)
+    s3fs.core.S3File.commit = _patched_s3fs_commit
+except ImportError:
+    pass
+
 import click
 import click_odoo
 from click_odoo import odoo
@@ -130,7 +145,6 @@ def _backup_filestore(cr, dbname, backup, minimal):
             )
             fs, directory_path = _get_fsspec_filesystem(storage_code)
             path = os.path.normpath(os.path.join(directory_path, fname))
-            print(f'Adding filestore file {archive_name}')
             with fs.open(path, mode="rb") as fh:
                 backup.add_fileh(fh, archive_name)
         else:
@@ -140,7 +154,6 @@ def _backup_filestore(cr, dbname, backup, minimal):
                 FILESTORE_DIRNAME,
                 os.path.normpath(store_fname),
             )
-            print(f'Adding filestore file {archive_name}')
             if os.path.isfile(path):
                 backup.addfile(path, archive_name)
 

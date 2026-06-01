@@ -102,15 +102,15 @@ class ZipBackup(AbstractBackup):
 
     def add_fsspec_file(self, fs, filename, arcname):
         with fs.open(filename, mode="rb") as inputh:
-            with tempfile.NamedTemporaryFile(mode="wb") as outputh:
+            with tempfile.NamedTemporaryFile(mode="wb") as tempfh:
                 while True:
                     chunk = inputh.read(self.chunk_size)
                     if not chunk:
                         break
-                    outputh.write(chunk)
+                    tempfh.write(chunk)
 
-                outputh.seek(0)
-                self.addfile(outputh.name, arcname)
+                tempfh.seek(0)
+                self.addfile(tempfh.name, arcname)
 
     def add_data(self, buffer, arcname):
         with tempfile.NamedTemporaryFile(mode="wb") as f:
@@ -168,15 +168,15 @@ class FolderBackup(AbstractBackup):
 
     def add_fsspec_file(self, fs, filename, arcname):
         with fs.open(filename, mode="rb") as inputh:
-            with tempfile.NamedTemporaryFile(mode="wb") as outputh:
+            with tempfile.NamedTemporaryFile(mode="wb") as tempfh:
                 while True:
                     chunk = inputh.read(self.chunk_size)
                     if not chunk:
                         break
-                    outputh.write(chunk)
+                    tempfh.write(chunk)
 
-                outputh.seek(0)
-                self.addfile(outputh.name, arcname)
+                tempfh.seek(0)
+                self.addfile(tempfh.name, arcname)
 
     def add_data(self, buffer, arcname):
         with tempfile.NamedTemporaryFile(mode="wb") as f:
@@ -197,16 +197,14 @@ class FolderBackup(AbstractBackup):
 
 class StreamingZipBackup(ZipBackup):
     format = "stream-zip"
-    chunk_size = DEFAULT_CHUNK_SIZE
 
-    def __init__(self, path, mode, chunk_size=None):
+    def __init__(self, path, mode, chunk_size=DEFAULT_CHUNK_SIZE):
         if mode != "w":
             raise NotImplementedError('Only mode "w" is supported here')
         self._path = path
         self._mode = mode
         self._zip_members = []
-        if chunk_size is not None:
-            self.chunk_size = chunk_size
+        self.chunk_size = chunk_size
 
     def add_data(self, buffer, arcname):
         def _yield_buffer():
@@ -300,9 +298,135 @@ class StreamingZipBackup(ZipBackup):
     def delete(self):
         raise NotImplementedError
 
+class QueuedWriter:
+    """
+    A file-like object that buffers writes in memory and flushes them to an
+    underlying file object via a background thread. 
+    
+    This prevents fast CPU-bound operations (like zip compression) from blocking
+    on slow I/O bound operations (like S3 network uploads). It limits memory 
+    usage based on total bytes rather than chunk count, which handles thousands 
+    of tiny writes efficiently without premature blocking.
+    """
+    def __init__(self, file_obj, max_bytes=128 * 1024 * 1024):
+        import threading
+        self.file_obj = file_obj
+        self.max_bytes = max_bytes
+        
+        # Thread synchronization primitives
+        self.condition = threading.Condition()
+        
+        # State
+        self.chunks = []
+        self.bytes_in_queue = 0
+        self._closed = False
+        self._exception = None
+        self._pos = 0  # To satisfy zipfile's tell() requirement
+        
+        # Start background writer thread
+        self.thread = threading.Thread(target=self._writer_thread, daemon=True)
+        self.thread.start()
+        
+    def _writer_thread(self):
+        """Background thread that consumes the queue and writes to the underlying file."""
+        try:
+            while True:
+                with self.condition:
+                    # Wait until there is data to write, the writer is closed, or an error occurred
+                    while not self.chunks and not self._closed and not self._exception:
+                        self.condition.wait()
+                    
+                    if self._exception:
+                        break  # Abort if another thread encountered an error
+                    
+                    if not self.chunks and self._closed:
+                        break  # Clean exit when everything is flushed and closed
+                    
+                    # Coalesce small chunks into larger ones (up to 8MB). 
+                    # Network streams (like s3fs) perform poorly with thousands of tiny write calls.
+                    # Grouping them improves CPU and network throughput significantly.
+                    buffer = []
+                    buffer_len = 0
+                    while self.chunks and buffer_len < 8 * 1024 * 1024:
+                        chunk = self.chunks.pop(0)
+                        buffer.append(chunk)
+                        buffer_len += len(chunk)
+                        
+                    self.bytes_in_queue -= buffer_len
+                    # Notify the main thread that space has opened up in the queue
+                    self.condition.notify_all()
+                    
+                # Write outside the lock to allow concurrent enqueueing from the main thread
+                chunk_data = b"".join(buffer)
+                self.file_obj.write(chunk_data)
+                
+        except Exception as e:
+            # If the network write fails, capture the exception and stop processing.
+            # The main thread will raise this exception on its next interaction.
+            with self.condition:
+                self._exception = e
+                self.chunks.clear()
+                self.bytes_in_queue = 0
+                self.condition.notify_all()
+
+    def write(self, data):
+        """Called by the main thread (e.g., zipfile) to queue data for writing."""
+        if not data: 
+            return 0
+            
+        data_len = len(data)
+        with self.condition:
+            if self._exception:
+                raise self._exception
+                
+            # Block the main thread if the queue is full (compressing faster than network upload)
+            while self.bytes_in_queue + data_len > self.max_bytes and not self._exception:
+                self.condition.wait()
+                
+            # Check exception again in case it was raised while we were waiting
+            if self._exception:
+                raise self._exception
+                
+            self.chunks.append(data)
+            self.bytes_in_queue += data_len
+            self.condition.notify_all()  # Wake up the writer thread
+            
+        self._pos += data_len
+        return data_len
+
+    def close(self):
+        """Flush remaining data and join the background thread."""
+        with self.condition:
+            if self._closed: 
+                return
+            self._closed = True
+            self.condition.notify_all()  # Ensure thread wakes up to exit
+            
+        self.thread.join()
+        
+        # Re-raise any network/writing errors in the main thread
+        if self._exception:
+            raise self._exception
+
+    def flush(self):
+        # We don't forcefully flush the background thread queue here.
+        # zipfile calls flush() frequently; blocking here would defeat the queue's purpose.
+        if hasattr(self.file_obj, 'flush'):
+            self.file_obj.flush()
+            
+    def tell(self):
+        # zipfile strictly requires tell() to work synchronously
+        return self._pos
+
+    def __enter__(self):
+        return self
+        
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
 class FsspecZipBackup(ZipBackup):
     format = "fsspec-zip"
-    chunk_size = DEFAULT_CHUNK_SIZE
+    chunk_size = 1024 * 1024
 
     def __init__(self, path, mode, chunk_size=None, fsspec_out=None):
         if mode != "w":
@@ -313,7 +437,9 @@ class FsspecZipBackup(ZipBackup):
 
         if chunk_size is not None:
             self.chunk_size = chunk_size
-        self.zip_fs = fsspec.filesystem("zip",mode=mode, fo=fsspec_out)
+        
+        self.queued_out = QueuedWriter(fsspec_out, max_bytes=128 * 1024 * 1024)
+        self.zip_fs = fsspec.filesystem("zip",mode=mode, fo=self.queued_out)
 
     def add_data(self, buffer, arcname):
         with self.zip_fs.open(arcname, 'wb') as out:
@@ -341,6 +467,7 @@ class FsspecZipBackup(ZipBackup):
 
     def close(self):
         self.zip_fs.close()
+        self.queued_out.close()
 
     def delete(self):
         raise NotImplementedError
