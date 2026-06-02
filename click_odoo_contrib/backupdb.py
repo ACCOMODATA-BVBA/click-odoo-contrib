@@ -60,7 +60,7 @@ def _dump_db_command(dbname, backup):
 
 def _dump_db(dbname, backup):
     cmd, env, filename = _dump_db_command(dbname, backup)
-    if backup.format in ("stream-zip", "fsspec-zip"):
+    if backup.format == "fsspec-zip":
         backup.add_dump_command(cmd, env, filename)
     else:
         stdout = subprocess.Popen(
@@ -145,7 +145,7 @@ def _backup_filestore(cr, dbname, backup, minimal):
 )
 @click.option(
     "--format",
-    type=click.Choice(["zip", "dump", "folder", "stream-zip", "fsspec-zip"]),
+    type=click.Choice(["zip", "dump", "folder", "fsspec-zip"]),
     default="zip",
     show_default=True,
     help="Output format",
@@ -198,7 +198,7 @@ def main(
 
     Finally this script allows to upload directly to remote storage
     streaming the zip file without having memory or diskspace
-    constraints that large backups might introduce.  Choose stream-zip
+    constraints that large backups might introduce.  Choose fsspec-zip
     as output format for this. Configuration for fsspec is
     read from odoo.conf
 
@@ -227,10 +227,10 @@ def main(
             else:
                 shutil.rmtree(dest)
 
-    if format in ("fsspec-zip", "stream-zip"):
+    if format == "fsspec-zip":
         fs, directory = get_fsspec_filesystem(FS_STORAGE_BACKUP_ENTRY)
 
-        backup_fullpath = f"{directory}/{dest}"
+        backup_fullpath = f"{directory}/{dest}" if directory else dest
         # Run touch to identify access problems early
         fs.touch(backup_fullpath)
 
@@ -262,17 +262,7 @@ def main(
 
             print("Adding dump")
             _dump_db(dbname, _backup)
-        if format == "stream-zip":
-            backup_fileh = _backup.get_file_object()
 
-            with fs.open(
-                backup_fullpath, mode="wb", blocksize=FS_WRITE_CHUNK_SIZE
-            ) as upload_fileh:
-                while True:
-                    buffer = backup_fileh.read(FS_WRITE_CHUNK_SIZE)
-                    if not buffer:
-                        break
-                    upload_fileh.write(buffer)
     finally:
         if fsspec_out:
             fsspec_out.close()

@@ -8,9 +8,7 @@ from contextlib import contextmanager
 import subprocess
 import fsspec
 
-import stream_zip
 import datetime
-import to_file_like_obj
 
 # default chunk size for generators in streaming backup
 DEFAULT_CHUNK_SIZE = 1024 * 1024
@@ -194,110 +192,6 @@ class FolderBackup(AbstractBackup):
     def delete(self):
         shutil.rmtree(self._path)
 
-
-class StreamingZipBackup(ZipBackup):
-    format = "stream-zip"
-
-    def __init__(self, path, mode, chunk_size=DEFAULT_CHUNK_SIZE):
-        if mode != "w":
-            raise NotImplementedError('Only mode "w" is supported here')
-        self._path = path
-        self._mode = mode
-        self._zip_members = []
-        self.chunk_size = chunk_size
-
-    def add_data(self, buffer, arcname):
-        def _yield_buffer():
-            yield buffer
-
-        self._zip_members.append(
-            (
-                arcname,
-                datetime.datetime.now(),
-                0o664,
-                stream_zip.ZIP_64,
-                _yield_buffer(),
-            )
-        )
-
-    def addfile(self, filename, arcname):
-        def _get_file_chunks():
-            with open(filename, "rb") as fileh:
-                while True:
-                    chunk = fileh.read(self.chunk_size)
-                    if not chunk:
-                        break
-                    yield chunk
-
-        statinfo = os.stat(filename)
-
-        self._zip_members.append(
-            (
-                arcname,
-                datetime.datetime.fromtimestamp(statinfo.st_mtime),
-                0o664,
-                stream_zip.ZIP_64,
-                _get_file_chunks(),
-            )
-        )
-
-    def add_fsspec_file(self, fs, filename, arcname):
-        def _get_file_chunks():
-            with fs.open(filename, mode="rb") as fileh:
-                while True:
-                    chunk = fileh.read(self.chunk_size)
-                    if not chunk:
-                        break
-                    yield chunk
-
-        self._zip_members.append(
-            (
-                arcname,
-                datetime.datetime.now(),
-                0o664,
-                stream_zip.ZIP_64,
-                _get_file_chunks(),
-            )
-        )
-
-    def write(self, stream, arcname):
-        raise NotImplementedError()  # pragma: no cover
-
-    def add_dump_command(self, cmd, env, filename):
-        def _generator():
-            with popen_check(
-                cmd, 
-                env=env, 
-                stdin=subprocess.DEVNULL, 
-                stdout=subprocess.PIPE
-            ) as dump:
-                while True:
-                    chunk = dump.stdout.read(self.chunk_size)
-                    if not chunk:
-                            break
-                    yield chunk
-
-        self._zip_members.append(
-            (
-                "dump.sql",
-                datetime.datetime.now(),
-                0o664,
-                stream_zip.ZIP_64,
-                _generator(),
-            )
-        )
-
-    def get_file_object(self):
-        return to_file_like_obj.to_file_like_obj(
-            stream_zip.stream_zip(self._zip_members)
-        )
-
-    def close(self):
-        pass
-
-    def delete(self):
-        raise NotImplementedError
-
 class QueuedWriter:
     """
     A file-like object that buffers writes in memory and flushes them to an
@@ -479,7 +373,6 @@ BACKUP_FORMAT = {
     ZipBackup.format: ZipBackup,
     DumpBackup.format: DumpBackup,
     FolderBackup.format: FolderBackup,
-    StreamingZipBackup.format: StreamingZipBackup,
     FsspecZipBackup.format: FsspecZipBackup,
 }
 
