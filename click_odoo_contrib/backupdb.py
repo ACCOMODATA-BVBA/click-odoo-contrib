@@ -6,25 +6,6 @@ import json
 import os
 import shutil
 import subprocess
-import fsspec
-
-# Monkey patch s3fs to fix InvalidPartOrder during concurrent uploads
-try:
-    import s3fs.core
-
-    _original_s3fs_commit = s3fs.core.S3File.commit
-
-    def _patched_s3fs_commit(self):
-        if hasattr(self, "parts") and isinstance(self.parts, list):
-            try:
-                self.parts.sort(key=lambda x: x.get("PartNumber", 0))
-            except Exception:
-                pass
-        return _original_s3fs_commit(self)
-
-    s3fs.core.S3File.commit = _patched_s3fs_commit
-except ImportError:
-    pass
 
 import click
 import click_odoo
@@ -45,7 +26,7 @@ from ._storage_config import (
 
 
 # default chunk size for upload with streaming backup
-FS_WRITE_CHUNK_SIZE = 4 * 1024 * 1024
+FS_WRITE_CHUNK_SIZE = 5 * 1024 * 1024
 
 
 def _dump_db_command(dbname, backup):
@@ -60,13 +41,7 @@ def _dump_db_command(dbname, backup):
 
 def _dump_db(dbname, backup):
     cmd, env, filename = _dump_db_command(dbname, backup)
-    if backup.format == "fsspec-zip":
-        backup.add_dump_command(cmd, env, filename)
-    else:
-        stdout = subprocess.Popen(
-            cmd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE
-        ).stdout
-        backup.write(stdout, filename)
+    backup.add_dump_command(cmd, env, filename)
 
 
 def _get_filestore_file_list(cr, dbname, minimal=False):
@@ -145,10 +120,16 @@ def _backup_filestore(cr, dbname, backup, minimal):
 )
 @click.option(
     "--format",
-    type=click.Choice(["zip", "dump", "folder", "fsspec-zip"]),
+    type=click.Choice(["zip", "dump", "folder"]),
     default="zip",
     show_default=True,
     help="Output format",
+)
+@click.option(
+    "--fsstorage",
+    is_flag=True,
+    show_default=True,
+    help="Output backup to the fs_storage location set in odoo.conf format",
 )
 @click.option(
     "--filestore",
@@ -179,6 +160,7 @@ def main(
     if_exists,
     format,
     filestore,
+    fsstorage,
 ):
     """Create an Odoo database backup from an existing one.
 
@@ -198,9 +180,9 @@ def main(
 
     Finally this script allows to upload directly to remote storage
     streaming the zip file without having memory or diskspace
-    constraints that large backups might introduce.  Choose fsspec-zip
-    as output format for this. Configuration for fsspec is
-    read from odoo.conf
+    constraints that large backups might introduce.  Choose zip
+    as output format for this with the --fsstorage option.
+    Configuration for fsspec/fsstorage is read from odoo.conf
 
     This script also supports backup from attachments stored using
     the fs_attachment OCA module.  These attachments will be stored
@@ -227,45 +209,42 @@ def main(
             else:
                 shutil.rmtree(dest)
 
-    if format == "fsspec-zip":
+    if fsstorage:
         fs, directory = get_fsspec_filesystem(FS_STORAGE_BACKUP_ENTRY)
 
         backup_fullpath = f"{directory}/{dest}" if directory else dest
         # Run touch to identify access problems early
         fs.touch(backup_fullpath)
+        fsspec_out = fs.open(
+            backup_fullpath,
+            mode="wb",
+            blocksize=FS_WRITE_CHUNK_SIZE,
+        )
+    else:
+        fs, _ignored = get_fsspec_filesystem('local')
+        fsspec_out = fs.open(
+            dest,
+            mode="wb",
+        )
 
     if format == "dump":
         filestore = False
     db = odoo.sql_db.db_connect(dbname)
     try:
-        if format == "fsspec-zip":
-            fsspec_out = fs.open(
-                backup_fullpath,
-                mode="wb",
-                blocksize=FS_WRITE_CHUNK_SIZE,
-            )
-        else:
-            fsspec_out = None
-
         with backup(
             format, dest, "w", fsspec_out=fsspec_out
         ) as _backup, db.cursor() as cr, db_management_enabled():
             if format != "dump":
-                print("Adding manifest")
                 _create_manifest(cr, dbname, _backup)
             if filestore == "minimal":
-                print("Adding minimal filestore")
                 _backup_filestore(cr, dbname, _backup, minimal=True)
             elif filestore == "full":
-                print("Adding full filestore")
                 _backup_filestore(cr, dbname, _backup, minimal=False)
 
-            print("Adding dump")
             _dump_db(dbname, _backup)
 
     finally:
-        if fsspec_out:
-            fsspec_out.close()
+        fsspec_out.close()
         odoo.sql_db.close_db(dbname)
 
 

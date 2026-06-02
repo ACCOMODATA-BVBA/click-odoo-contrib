@@ -19,7 +19,9 @@ FS_STORAGE_BACKUP_ENTRY = "odoo_backups"
 
 
 def _load_config():
-    config = {}
+    config = {
+        'local': ( fsspec.filesystem('local'), None)
+    }
     for item, vals in odoo.tools.config.misc.items():
         if not item.startswith(FS_STORAGE_KEY):
             continue

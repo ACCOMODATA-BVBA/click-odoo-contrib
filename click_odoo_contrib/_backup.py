@@ -76,62 +76,6 @@ class AbstractBackup:
         raise NotImplementedError()  # pragma: no cover
 
 
-class ZipBackup(AbstractBackup):
-    format = "zip"
-    chunk_size = DEFAULT_CHUNK_SIZE
-
-    def __init__(self, path, mode):
-        super().__init__(path, mode)
-        self._zipFile = zipfile.ZipFile(
-            self._path, self._mode, compression=zipfile.ZIP_DEFLATED, allowZip64=True
-        )
-
-    def addtree(self, src, arcname):
-        len_prefix = len(src) + 1
-        for dirpath, _dirnames, filenames in os.walk(src):
-            for fname in filenames:
-                path = os.path.normpath(os.path.join(dirpath, fname))
-                if os.path.isfile(path):
-                    _arcname = os.path.join(arcname, path[len_prefix:])
-                    self.addfile(path, _arcname)
-
-    def addfile(self, filename, arcname):
-        self._zipFile.write(filename, arcname)
-
-    def add_fsspec_file(self, fs, filename, arcname):
-        with fs.open(filename, mode="rb") as inputh:
-            with tempfile.NamedTemporaryFile(mode="wb") as tempfh:
-                while True:
-                    chunk = inputh.read(self.chunk_size)
-                    if not chunk:
-                        break
-                    tempfh.write(chunk)
-
-                tempfh.seek(0)
-                self.addfile(tempfh.name, arcname)
-
-    def add_data(self, buffer, arcname):
-        with tempfile.NamedTemporaryFile(mode="wb") as f:
-            f.write(buffer)
-            f.seek(0)
-            self.addfile(f.name, arcname)
-
-    def write(self, stream, arcname):
-        with tempfile.NamedTemporaryFile() as f:
-            shutil.copyfileobj(stream, f)
-            f.seek(0)
-            self._zipFile.write(f.name, arcname)
-
-    def close(self):
-        self._zipFile.close()
-
-    def delete(self):
-        try:
-            self.close()
-        finally:
-            os.unlink(self._path)
-
-
 class DumpBackup(AbstractBackup):
     format = "dump"
 
@@ -318,8 +262,8 @@ class QueuedWriter:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
 
-class FsspecZipBackup(ZipBackup):
-    format = "fsspec-zip"
+class FsspecZipBackup(AbstractBackup):
+    format = "zip"
     chunk_size = 1024 * 1024
 
     def __init__(self, path, mode, chunk_size=None, fsspec_out=None):
@@ -334,6 +278,15 @@ class FsspecZipBackup(ZipBackup):
         
         self.queued_out = QueuedWriter(fsspec_out, max_bytes=128 * 1024 * 1024)
         self.zip_fs = fsspec.filesystem("zip",mode=mode, fo=self.queued_out)
+
+    def addtree(self, src, arcname):
+        len_prefix = len(src) + 1
+        for dirpath, _dirnames, filenames in os.walk(src):
+            for fname in filenames:
+                path = os.path.normpath(os.path.join(dirpath, fname))
+                if os.path.isfile(path):
+                    _arcname = os.path.join(arcname, path[len_prefix:])
+                    self.addfile(path, _arcname)
 
     def add_data(self, buffer, arcname):
         with self.zip_fs.open(arcname, 'wb') as out:
@@ -360,17 +313,16 @@ class FsspecZipBackup(ZipBackup):
             self.add_fileh(dump.stdout, arcname)
 
     def close(self):
-        self.zip_fs.close()
         self.queued_out.close()
+        self.zip_fs.close()
 
     def delete(self):
-        raise NotImplementedError
+        self.zip_fs.rm()
 
 
 
 
 BACKUP_FORMAT = {
-    ZipBackup.format: ZipBackup,
     DumpBackup.format: DumpBackup,
     FolderBackup.format: FolderBackup,
     FsspecZipBackup.format: FsspecZipBackup,
