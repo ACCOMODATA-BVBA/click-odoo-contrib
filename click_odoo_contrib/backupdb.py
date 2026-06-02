@@ -13,18 +13,26 @@ from click_odoo import odoo
 
 from ._backup import backup
 from ._dbutils import db_exists, db_management_enabled, pg_connect
-from ._s3 import S3Client
 
-MANIFEST_FILENAME = "manifest.json"
-DBDUMP_FILENAME = "db.dump"
-FILESTORE_DIRNAME = "filestore"
-FILESTORE_FILE_REGEX = "^[a-f0-9]{2}/[a-f0-9]{40}"
+from ._storage_config import (
+    MANIFEST_FILENAME,
+    DUMP_SQL_FILENAME,
+    DBDUMP_FILENAME,
+    FILESTORE_DIRNAME,
+    FS_ATTACHMENT_DIRNAME,
+    FS_STORAGE_BACKUP_ENTRY,
+    get_fsspec_filesystem,
+)
+
+
+# default chunk size for upload with streaming backup
+FS_WRITE_CHUNK_SIZE = 5 * 1024 * 1024
 
 
 def _dump_db_command(dbname, backup):
     cmd = ["pg_dump", "--no-owner", dbname]
     env = odoo.tools.misc.exec_pg_environ()
-    filename = "dump.sql"
+    filename = DUMP_SQL_FILENAME
     if backup.format in {"dump", "folder"}:
         cmd.insert(-1, "--format=c")
         filename = DBDUMP_FILENAME
@@ -33,24 +41,16 @@ def _dump_db_command(dbname, backup):
 
 def _dump_db(dbname, backup):
     cmd, env, filename = _dump_db_command(dbname, backup)
-    if backup.format == "stream-zip":
-        backup.add_dump_command(cmd, env, filename)
-    else:
-        stdout = subprocess.Popen(
-            cmd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE
-        ).stdout
-        backup.write(stdout, filename)
+    backup.add_dump_command(cmd, env, filename)
 
 
 def _get_filestore_file_list(cr, dbname, minimal=False):
-    filestore_path = odoo.tools.config.filestore(dbname)
     if minimal:
         qry = (
             "SELECT DISTINCT store_fname "
             "FROM ir_attachment "
             "WHERE create_uid IN (1, 2) "
             "   AND store_fname IS NOT NULL "
-            f"   AND store_fname ~ '{FILESTORE_FILE_REGEX}'"
             "   AND ("
             "       res_model IN ("
             "           'ir.ui.view',"
@@ -58,18 +58,18 @@ def _get_filestore_file_list(cr, dbname, minimal=False):
             "           'res.company',"
             "           'res.lang' )"
             "          OR res_model IS NULL "
-            "          OR name ILIKE '%assets%'"
+            r"          OR name ILIKE '%assets%'"
             "   )"
         )
     else:
         qry = (
             "SELECT DISTINCT store_fname "
             "FROM ir_attachment "
-            f"WHERE store_fname ~ '{FILESTORE_FILE_REGEX}'"
+            "WHERE store_fname IS NOT NULL"
         )
     with pg_connect(dbname) as cr:
         cr.execute(qry)
-        result = [os.path.join(filestore_path, item[0]) for item in cr.fetchall()]
+        result = [item[0] for item in cr.fetchall()]
     return result
 
 
@@ -78,61 +78,31 @@ def _create_manifest(cr, dbname, backup):
     backup.add_data(json.dumps(manifest, indent=4).encode("utf-8"), MANIFEST_FILENAME)
 
 
-def _backup_filestore(dbname, backup):
-    filestore_source = odoo.tools.config.filestore(dbname)
-    if os.path.isdir(filestore_source):
-        backup.addtree(filestore_source, FILESTORE_DIRNAME)
+def _backup_filestore(cr, dbname, backup, minimal):
+    filestore_path = odoo.tools.config.filestore(dbname)
 
-
-def _backup_filestore_adv(cr, dbname, backup, minimal):
-    filestore_source = odoo.tools.config.filestore(dbname)
-    len_prefix = len(filestore_source) + 1
-    for fname in _get_filestore_file_list(cr, dbname, minimal):
-        path = os.path.normpath(fname)
-        if os.path.isfile(path):
-            _arcname = os.path.join(FILESTORE_DIRNAME, path[len_prefix:])
-            backup.addfile(path, _arcname)
-
-
-def _get_s3_client(
-    aws_access_key_id=None,
-    aws_secret_access_key=None,
-    aws_endpoint_url=None,
-    aws_region=None,
-    aws_bucketname=None,
-):
-    missing = []
-    if aws_access_key_id is None:
-        aws_access_key_id = os.getenv("AWS_ACCESS_KEY_ID")
-        if aws_access_key_id is None:
-            missing.append("aws_access_key_id")
-    if aws_secret_access_key is None:
-        aws_secret_access_key = os.getenv("AWS_SECRET_ACCESS_KEY")
-        if aws_secret_access_key is None:
-            missing.append("aws_secret_access_key")
-    if aws_endpoint_url is None:
-        aws_endpoint_url = os.getenv("AWS_ENDPOINT_URL")
-        if aws_endpoint_url is None:
-            missing.append("aws_endpoint_url")
-    if aws_region is None:
-        aws_region = os.getenv("AWS_REGION")
-        if aws_region is None:
-            missing.append("aws_region")
-    if aws_bucketname is None:
-        aws_bucketname = os.getenv("AWS_BUCKETNAME")
-        if aws_bucketname is None:
-            missing.append("aws_bucketname")
-
-    if missing:
-        raise Exception("Missing s3 credentials: ", ",".join(missing))
-
-    return S3Client(
-        aws_access_key_id=aws_access_key_id,
-        aws_secret_access_key=aws_secret_access_key,
-        endpoint_url=aws_endpoint_url,
-        region_name=aws_region,
-        bucket=aws_bucketname,
-    )
+    for store_fname in _get_filestore_file_list(cr, dbname, minimal):
+        if "://" in store_fname:
+            # fs_attachment based attachment
+            storage_code, _ignored, fname = store_fname.partition("://")
+            archive_name = os.path.join(
+                FS_ATTACHMENT_DIRNAME,
+                storage_code,
+                fname,
+            )
+            fs, directory_path = get_fsspec_filesystem(storage_code)
+            path = os.path.normpath(os.path.join(directory_path, fname))
+            with fs.open(path, mode="rb") as fh:
+                backup.add_fileh(fh, archive_name)
+        else:
+            # classic filestore attachment
+            path = os.path.normpath(os.path.join(filestore_path, store_fname))
+            archive_name = os.path.join(
+                FILESTORE_DIRNAME,
+                os.path.normpath(store_fname),
+            )
+            if os.path.isfile(path):
+                backup.addfile(path, archive_name)
 
 
 @click.command()
@@ -150,10 +120,16 @@ def _get_s3_client(
 )
 @click.option(
     "--format",
-    type=click.Choice(["zip", "dump", "folder", "stream-zip"]),
+    type=click.Choice(["zip", "dump", "folder"]),
     default="zip",
     show_default=True,
     help="Output format",
+)
+@click.option(
+    "--fsstorage",
+    is_flag=True,
+    show_default=True,
+    help="Output backup to the fs_storage location set in odoo.conf format",
 )
 @click.option(
     "--filestore",
@@ -174,36 +150,6 @@ def _get_s3_client(
     flag_value="minimal",
     help="Include only minimal filestore",
 )
-@click.option(
-    "--aws_access_key_id",
-    default=None,
-    show_default=False,
-    help="Specify s3 aws_access_key_id or define environment value AWS_ACCESS_KEY_ID",
-)
-@click.option(
-    "--aws_secret_access_key",
-    default=None,
-    show_default=False,
-    help="Specify s3 aws_secret_access_key or define environment value AWS_SECRET_ACCESS_KEY",
-)
-@click.option(
-    "--aws_endpoint_url",
-    default=None,
-    show_default=False,
-    help="Specify s3 aws_endpoint_url or define environment value AWS_ENDPOINT_URL",
-)
-@click.option(
-    "--aws_region",
-    default=None,
-    show_default=False,
-    help="Specify s3 aws_region or define environment value AWS_REGION",
-)
-@click.option(
-    "--aws_bucketname",
-    default=None,
-    show_default=False,
-    help="Specify s3 aws_bucketname or define environment value AWS_BUCKETNAME",
-)
 @click.argument("dbname", nargs=1)
 @click.argument("dest", nargs=1, required=1)
 def main(
@@ -214,11 +160,7 @@ def main(
     if_exists,
     format,
     filestore,
-    aws_access_key_id,
-    aws_secret_access_key,
-    aws_endpoint_url,
-    aws_region,
-    aws_bucketname,
+    fsstorage,
 ):
     """Create an Odoo database backup from an existing one.
 
@@ -235,6 +177,17 @@ def main(
     memory consumption since the files in the filestore are
     directly copied to the target directory as well as the
     database dump.
+
+    Finally this script allows to upload directly to remote storage
+    streaming the zip file without having memory or diskspace
+    constraints that large backups might introduce.  Choose zip
+    as output format for this with the --fsstorage option.
+    Configuration for fsspec/fsstorage is read from odoo.conf
+
+    This script also supports backup from attachments stored using
+    the fs_attachment OCA module.  These attachments will be stored
+    in the zip file in a folder with the same name as the fs_storage
+    name, in the folder "fs_storage/[storage_name]/"
 
     """
     if not db_exists(dbname):
@@ -255,34 +208,43 @@ def main(
                 os.unlink(dest)
             else:
                 shutil.rmtree(dest)
-    if format == "stream-zip":
-        s3_client = _get_s3_client(
-            aws_access_key_id,
-            aws_secret_access_key,
-            aws_endpoint_url,
-            aws_region,
-            aws_bucketname,
+
+    if fsstorage:
+        fs, directory = get_fsspec_filesystem(FS_STORAGE_BACKUP_ENTRY)
+
+        backup_fullpath = f"{directory}/{dest}" if directory else dest
+        # Run touch to identify access problems early
+        fs.touch(backup_fullpath)
+        fsspec_out = fs.open(
+            backup_fullpath,
+            mode="wb",
+            blocksize=FS_WRITE_CHUNK_SIZE,
         )
-        s3_client.test_access_upload(dest)
+    else:
+        fs, _ignored = get_fsspec_filesystem('local')
+        fsspec_out = fs.open(
+            dest,
+            mode="wb",
+        )
 
     if format == "dump":
         filestore = False
     db = odoo.sql_db.db_connect(dbname)
     try:
         with backup(
-            format, dest, "w"
+            format, dest, "w", fsspec_out=fsspec_out
         ) as _backup, db.cursor() as cr, db_management_enabled():
             if format != "dump":
                 _create_manifest(cr, dbname, _backup)
             if filestore == "minimal":
-                _backup_filestore_adv(cr, dbname, _backup, minimal=True)
+                _backup_filestore(cr, dbname, _backup, minimal=True)
             elif filestore == "full":
-                _backup_filestore_adv(cr, dbname, _backup, minimal=False)
+                _backup_filestore(cr, dbname, _backup, minimal=False)
 
             _dump_db(dbname, _backup)
-        if format == "stream-zip":
-            s3_client.upload_fileh(dest, _backup.get_file_object())
+
     finally:
+        fsspec_out.close()
         odoo.sql_db.close_db(dbname)
 
 

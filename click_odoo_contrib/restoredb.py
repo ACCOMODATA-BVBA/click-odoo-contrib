@@ -11,26 +11,59 @@ import click_odoo
 import psycopg2
 from click_odoo import OdooEnvironment, odoo
 
+import fsspec
 
 from ._dbutils import db_exists, db_management_enabled, reset_config_parameters
-from .backupdb import DBDUMP_FILENAME, FILESTORE_DIRNAME, MANIFEST_FILENAME
-from ._download_utils import url_chunck_generator
+from ._storage_config import (
+    DUMP_SQL_FILENAME,
+    DBDUMP_FILENAME,
+    FILESTORE_DIRNAME,
+    MANIFEST_FILENAME,
+    FS_ATTACHMENT_DIRNAME,
+    get_target_filehandle,
+)
 
 import logging
-from stream_unzip import stream_unzip
 
 
 _logger = logging.getLogger(__name__)
 
 
-def _psql_from_chunks(dbname, chunks):
+def _extract_zip_fileh(dbname, source_zip_fh):
+    zip_fs = fsspec.filesystem("zip", fo=source_zip_fh)
+    for root, dirs, files in zip_fs.walk("/"):
+        for filename in files:
+            root_stripped = root.strip("/")
+            item_name = f"{root_stripped}/{filename}" if root_stripped else filename
+
+            with zip_fs.open(item_name, "rb") as zip_item_fh:
+                _restore_item_from_fh(item_name, zip_item_fh, dbname)
+
+
+def _restore_item_from_fh(archive_filename, file_h, dbname):
+    if archive_filename == DUMP_SQL_FILENAME:
+        print(f"Restoring dump")
+        _restore_psql_from_fileh(archive_filename, file_h, dbname)
+    elif ( 
+        archive_filename.startswith(FILESTORE_DIRNAME + "/")
+        or 
+        archive_filename.startswith(FS_ATTACHMENT_DIRNAME + "/")
+    ):
+        _restore_filestore_fileh(archive_filename, file_h, dbname)
+    elif archive_filename.startswith(MANIFEST_FILENAME):
+        print('Ignoring file "%s"' % archive_filename)
+        pass
+    else:
+        print(f"Unknown item in zipfile: '{archive_filename}'")
+
+
+def _restore_psql_from_fileh(item_name, file_h, dbname):
     pg_args = [
         "psql",
         "--quiet",
         f"--dbname={dbname}",
     ]
     pg_env = odoo.tools.misc.exec_pg_environ()
-    _logger.debug(f"Running {' '.join(pg_args)}")
     try:
         psql_popen = subprocess.Popen(
             pg_args,
@@ -40,82 +73,35 @@ def _psql_from_chunks(dbname, chunks):
             stderr=subprocess.DEVNULL,
         )
         try:
-            for chunk in chunks:
-                if psql_popen.poll() is not None:
-                    # psql died early
+            while True:
+                chunk = file_h.read(65536)
+                if not chunk:
                     break
                 psql_popen.stdin.write(chunk)
+        finally:
             psql_popen.stdin.close()
-            psql_popen.wait()
-        except BrokenPipeError:
-            _logger.error("Pipe broken: psql closed the connection early.")
 
-        if psql_popen.returncode != 0:
-            _logger.error("Postgres Restore Failed")
-            raise click.ClickException(
-                f"psql failed with exit code {psql_popen.returncode}"
-            )
-
+        returncode = psql_popen.wait()
+        if returncode != 0:
+            raise Exception(f"psql exited with return code {returncode}")
     except Exception as e:
         _logger.exception("Unexpected error during restore")
         raise click.ClickException("Couldn't restore database") from e
 
 
-def _check_path(full_path):
-    if os.path.exists(full_path):
-        return
-    parent_dir = os.path.dirname(full_path)
-    _check_path(parent_dir)
-    _logger.debug('created folder "%s"', full_path)
-    os.mkdir(full_path)
-
-
-def _restore_file_from_chunks(full_path, chunks):
+def _restore_filestore_fileh(archive_filename, file_h, dbname):
+    out_fh = get_target_filehandle(archive_filename, dbname)
     try:
-        _logger.debug('restoring file "%s"', full_path)
-        _check_path(os.path.dirname(full_path))
-        with open(full_path, "wb") as fileh:
-            for chunk in chunks:
-                fileh.write(chunk)
-    except IOError:
-        _logger.exception("Error writing to file %s", full_path)
-        # make sure to finish all chunks
-        for chunk in chunks:
-            pass
+        shutil.copyfileobj(file_h, out_fh)
+    finally:
+        out_fh.close()
 
 
-def _restore_from_zipchunks(dbname, zipped_chunks, copy=True, jobs=1, neutralize=False):
-    filestore_folder = odoo.tools.config.filestore(dbname)
-
-    for f_name, f_size, file_chunks in stream_unzip(zipped_chunks):
-        file_name = f_name.decode("utf-8")
-        if file_name == "dump.sql":
-            _psql_from_chunks(dbname, file_chunks)
-        elif file_name.startswith(f"{FILESTORE_DIRNAME}/"):
-            full_path = os.path.join(
-                filestore_folder, file_name.replace(f"{FILESTORE_DIRNAME}/", "")
-            )
-            _restore_file_from_chunks(full_path, file_chunks)
-        elif file_name == "manifest.json":
-            full_path = os.path.join(filestore_folder, "manifest.json")
-            _restore_file_from_chunks(full_path, file_chunks)
-        else:
-            _logger.warning('Unexpected file "%s" in zip file: ignoring', file_name)
-            # unzipped_chunks must be iterated to completion or
-            # UnfinishedIterationError will be raised
-            for chunk in file_chunks:
-                pass
-
-
-def _restore_from_url(dbname, source, copy, neutralize):
-    chunks_from_url = url_chunck_generator(url=source)
+def _restore_from_source(dbname, source, copy, neutralize):
     odoo.service.db._create_empty_database(dbname)
-    _restore_from_zipchunks(
-        dbname=dbname,
-        zipped_chunks=chunks_from_url,
-        copy=copy,
-        neutralize=neutralize,
-    )
+    with fsspec.open(source, mode="rb") as url_fileh:
+        _extract_zip_fileh(dbname, source_zip_fh=url_fileh)
+
     if copy:
         # if it's a copy of a database, force generation of a new dbuuid
         reset_config_parameters(dbname)
@@ -173,15 +159,6 @@ def _restore_from_folder(dbname, backup, copy=True, jobs=1, neutralize=False):
             except psycopg2.Error:
                 pass
     odoo.sql_db.close_db(dbname)
-
-
-def _restore_from_file(dbname, backup, copy=True, neutralize=False):
-    with db_management_enabled():
-        extra_kwargs = {}
-        if odoo.release.version_info >= (16, 0):
-            extra_kwargs["neutralize_database"] = neutralize
-        odoo.service.db.restore_db(dbname, backup, copy, **extra_kwargs)
-        odoo.sql_db.close_db(dbname)
 
 
 @click.command()
@@ -251,10 +228,12 @@ def main(env, dbname, source, copy, force, neutralize, jobs):
         raise click.ClickException(
             "--neutralize option is only available in odoo 16.0 and above"
         )
-    if source.startswith("http"):
-        _logger.debug('Restoring DB from "%s"', source)
-        _restore_from_url(dbname, source, copy, neutralize)
-    elif os.path.isfile(source):
-        _restore_from_file(dbname, source, copy, neutralize)
-    else:
+    if os.path.isdir(source):
         _restore_from_folder(dbname, source, copy, jobs, neutralize)
+    elif source:
+        _restore_from_source(dbname, source, copy, neutralize)
+    else:
+        raise click.ClickException(
+            "SOURCE argument missing"
+        )
+        

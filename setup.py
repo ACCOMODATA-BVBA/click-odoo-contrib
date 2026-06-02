@@ -21,8 +21,7 @@ setup(
     include_package_data=True,
     setup_requires=["setuptools-scm"],
     install_requires=[
-        "boto3",
-        "botocore",
+        "fsspec",
         "click-odoo>=1.3.0",
         "manifestoo-core>=0.7",
         "stream_unzip",
